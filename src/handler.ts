@@ -9,21 +9,22 @@ type Event = {
 const client = new EC2Client({})
 
 export async function handler(event: Event) {
-  console.log('Received event:', JSON.stringify(event))
-
-  const body = JSON.parse(event.body)
-
-  console.log('Parsed body:', JSON.stringify(body))
+  // Never log request data or parser errors: they can contain credentials.
+  let body
+  try {
+    body = JSON.parse(event.body)
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+      throw new Error('Invalid body')
+    }
+  } catch {
+    console.error('Resize request rejected: invalid JSON object')
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: 'Request body must be a JSON object' })
+    }
+  }
 
   const { volumeId, size } = body
-
-  console.log('Resize request:',
-    JSON.stringify({
-      volumeId,
-      size,
-      sizeType: typeof size
-    })
-  )
 
   if (!volumeId) {
     console.error('Validation failed: volumeId is missing')
@@ -48,13 +49,7 @@ export async function handler(event: Event) {
   }
 
   if (typeof size !== 'number' || !Number.isInteger(size) || size <= 0) {
-    console.error(
-      'Validation failed: invalid size:',
-      JSON.stringify({
-        size,
-        type: typeof size
-      })
-    )
+    console.error('Validation failed: invalid size')
 
     return {
       statusCode: 400,
@@ -62,13 +57,7 @@ export async function handler(event: Event) {
     }
   }
 
-  console.log(
-    'Calling ModifyVolume:',
-    JSON.stringify({
-      VolumeId: volumeId,
-      Size: size
-    })
-  )
+  console.log('Calling ModifyVolume')
 
   try {
 
@@ -80,10 +69,7 @@ export async function handler(event: Event) {
         })
       )
 
-    console.log(
-      'ModifyVolume result:',
-      JSON.stringify(result.VolumeModification)
-    )
+    console.log('ModifyVolume succeeded')
 
     return {
       statusCode: 200,
@@ -94,8 +80,8 @@ export async function handler(event: Event) {
         state: result.VolumeModification?.ModificationState
       })
     }
-  } catch (err) {
-    console.error('ModifyVolume failed:', err)
+  } catch {
+    console.error('ModifyVolume failed')
 
     return {
       statusCode: 500,
