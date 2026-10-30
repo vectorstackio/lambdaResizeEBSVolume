@@ -1,42 +1,30 @@
-const { test } = require('node:test')
-const assert = require('node:assert/strict')
-const fs = require('node:fs')
-const path = require('node:path')
-const vm = require('node:vm')
-const ts = require('typescript')
-const operation = path.basename(path.resolve(__dirname, '..'))
-const resize = operation === 'resizeEBSVolume'
-const source = fs.readFileSync(path.resolve(__dirname, '../src/handler.ts'), 'utf8')
-const compiled = ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
-}).outputText
+import { test, vi } from 'vitest'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import ts from 'typescript'
+import { handler } from '../src/handler.ts'
+
+const mocks = vi.hoisted(() => ({ send: vi.fn() }))
+vi.mock('@aws-sdk/client-ec2', () => ({
+  EC2Client: class { send = mocks.send },
+  ModifyVolumeCommand: class { constructor(input) { this.input = input } }
+}))
+const source = fs.readFileSync(path.resolve('src/handler.ts'), 'utf8')
 const marker = 'SENSITIVE_TEST_VALUE_DO_NOT_LOG'
-const allowed = new Set(resize ? [
+const allowed = new Set([
   'Resize request rejected: invalid JSON object',
   'Validation failed: volumeId is missing', 'Validation failed: size is missing',
   'Validation failed: invalid size', 'Calling ModifyVolume',
   'ModifyVolume succeeded', 'ModifyVolume failed'
-] : [
-  'Filesystem expansion request rejected: invalid JSON object',
-  'Sending filesystem expansion SSM command', 'Failed to send SSM command'
 ])
 function fixture(send) {
   const logs = []
-  const requests = []
-  const logger = Object.fromEntries(['log', 'error', 'warn', 'info', 'debug', 'trace', 'dir', 'table'].map(level => [level, (...args) => logs.push(args)]))
-  class Client {
-    async send(command) { requests.push(command.input); return send(command.input) }
+  mocks.send.mockReset().mockImplementation(command => send(command.input))
+  for (const level of ['log', 'error', 'warn', 'info', 'debug', 'trace', 'dir', 'table']) {
+    vi.spyOn(console, level).mockImplementation((...args) => logs.push(args))
   }
-  class Command { constructor(input) { this.input = input } }
-  const module = { exports: {} }
-  vm.runInNewContext(compiled, {
-    module, exports: module.exports, console: logger,
-    require(name) {
-      assert.ok(['@aws-sdk/client-ec2', '@aws-sdk/client-ssm'].includes(name))
-      return { EC2Client: Client, SSMClient: Client, ModifyVolumeCommand: Command, SendCommandCommand: Command }
-    }
-  })
-  return { handler: module.exports.handler, logs, requests }
+  return { handler, logs, get requests() { return mocks.send.mock.calls.map(call => call[0].input) } }
 }
 function checkLogs(logs) {
   for (const args of logs) {
@@ -57,17 +45,12 @@ function event(body) {
 const valid = { volumeId: 'vol-0123456789abcdef0', instanceId: 'i-0123456789abcdef0', size: 32, credentials: marker, nested: { token: marker } }
 
 test('success logs only allowlisted messages; request and service data never reach logs', async () => {
-  const result = resize ? { VolumeModification: { VolumeId: 'vol-0123456789abcdef0', OriginalSize: 16, TargetSize: 32, ModificationState: 'modifying', ignored: marker } } : { Command: { CommandId: 'test-command', Status: 'Pending', ignored: marker } }
+  const result = { VolumeModification: { VolumeId: 'vol-0123456789abcdef0', OriginalSize: 16, TargetSize: 32, ModificationState: 'modifying', ignored: marker } }
   const f = fixture(async () => result)
   const response = await f.handler(event(valid))
   assert.equal(response.statusCode, 200)
   assert.equal(f.requests.length, 1)
-  if (resize) assert.deepEqual(JSON.parse(response.body), { volumeId: valid.volumeId, originalSize: 16, targetSize: 32, state: 'modifying' })
-  else {
-    assert.deepEqual(JSON.parse(response.body), { commandId: 'test-command', instanceId: valid.instanceId, volumeId: valid.volumeId, status: 'Pending' })
-    assert.equal(f.requests[0].DocumentName, 'AWS-RunShellScript')
-    assert.equal(f.requests[0].InstanceIds[0], valid.instanceId)
-  }
+  assert.deepEqual(JSON.parse(response.body), { volumeId: valid.volumeId, originalSize: 16, targetSize: 32, state: 'modifying' })
   assert.ok(f.logs.length > 0)
   checkLogs(f.logs)
 })
@@ -94,11 +77,11 @@ test('malformed JSON cannot leak through parser exceptions or reach AWS', async 
 })
 
 test('validation paths never log arbitrary request fields', async () => {
-  const cases = resize ? [
+  const cases = [
     { size: 32, secret: marker }, { volumeId: marker },
     { volumeId: marker, size: marker }, { volumeId: marker, size: { secret: marker } },
     { volumeId: marker, size: -1 }
-  ] : [{ volumeId: marker, secret: marker }, { instanceId: marker, secret: marker }]
+  ]
   for (const body of cases) {
     const f = fixture(async () => { throw new Error('Unexpected AWS call') })
     const response = await f.handler(event(body))

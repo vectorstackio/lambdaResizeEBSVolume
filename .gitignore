@@ -50,3 +50,6 @@ Thumbs.db
 
 package-lock.json
 response.json
+
+# Test coverage
+coverage/
